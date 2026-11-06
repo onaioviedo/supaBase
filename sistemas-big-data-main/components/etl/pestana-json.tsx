@@ -1,146 +1,133 @@
 "use client"
 
-import { DownloadSimpleIcon } from "@phosphor-icons/react"
-import { cn } from "cn"
-import { useState } from "react"
+import * as React from "react"
+import { DownloadIcon } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import type { PipelineEtl } from "@/hooks/use-pipeline-etl"
 import type { RespuestaOpenMeteo } from "@/lib/etl/tipos"
 
-import { descargarJson, Estado, formatoEntero, Vacio } from "./comunes"
-import type { EstadoCiudad } from "./pipeline-etl"
+import { descargarJson } from "./formato"
+import { SinDatos } from "./sin-datos"
+import { Selector } from "./selector"
 
-const ELEMENTOS_VISIBLES = 24
+const MUESTRA = 24
 
 /**
- * JSON con sangría, pero con los arrays de valores en una sola línea y
- * recortados: el JSON completo de 31 días tiene miles de valores.
+ * Representación compacta del JSON: los metadatos completos y, de cada array
+ * horario, solo las primeras posiciones. El JSON íntegro se puede descargar.
  */
-function jsonAbreviado(valor: unknown, sangria = ""): string {
-  if (Array.isArray(valor)) {
-    const visibles = valor.slice(0, ELEMENTOS_VISIBLES).map((v) => JSON.stringify(v) ?? "undefined")
-    const resto = valor.length - visibles.length
-    return `[${visibles.join(", ")}${resto > 0 ? `, … (${formatoEntero(resto)} más)` : ""}]`
+function resumirJson(json: RespuestaOpenMeteo): string {
+  const { hourly, ...resto } = json
+  const lineas = JSON.stringify(resto, null, 2).split("\n")
+  lineas.pop() // cierre "}"
+  if (hourly && typeof hourly === "object") {
+    lineas[lineas.length - 1] += ","
+    lineas.push('  "hourly": {')
+    const entradas = Object.entries(hourly)
+    entradas.forEach(([clave, valor], i) => {
+      const coma = i < entradas.length - 1 ? "," : ""
+      if (Array.isArray(valor)) {
+        const muestra = valor.slice(0, MUESTRA).map((v) => JSON.stringify(v))
+        const resto = valor.length - muestra.length
+        lineas.push(
+          `    "${clave}": [${muestra.join(", ")}${resto > 0 ? `, … (+${resto} más)` : ""}]${coma}   // ${valor.length} elementos`
+        )
+      } else {
+        lineas.push(`    "${clave}": ${JSON.stringify(valor)}${coma}`)
+      }
+    })
+    lineas.push("  }")
   }
-  if (valor && typeof valor === "object") {
-    const interior = sangria + "  "
-    const entradas = Object.entries(valor).map(
-      ([k, v]) => `${interior}${JSON.stringify(k)}: ${jsonAbreviado(v, interior)}`
-    )
-    return `{\n${entradas.join(",\n")}\n${sangria}}`
-  }
-  return JSON.stringify(valor)
+  lineas.push("}")
+  return lineas.join("\n")
 }
 
-export function PestanaJson({
-  ciudades,
-  respuestas,
-}: {
-  ciudades: EstadoCiudad[]
-  respuestas: Record<string, RespuestaOpenMeteo>
-}) {
-  const [elegida, setElegida] = useState<string | null>(null)
-  if (ciudades.length === 0) {
-    return <Vacio>Todavía no hay extracciones. Configura el periodo y pulsa “Extraer datos”.</Vacio>
+export function PestanaJson({ etl }: { etl: PipelineEtl }) {
+  const descargas = etl.extraccion?.descargas ?? []
+  const [elegida, setElegida] = React.useState<string>("")
+  const actual =
+    descargas.find((d) => d.ciudad === elegida) ?? descargas[0] ?? null
+  const correctas = descargas.filter((d) => d.json)
+
+  if (!etl.extraccion) {
+    return (
+      <SinDatos>
+        Pulsa «Descargar los datos» (pestaña Extracción) para ver aquí las
+        respuestas originales.
+      </SinDatos>
+    )
   }
-  const actual = ciudades.find((c) => c.ciudad.id === elegida) ?? ciudades[0]
-  const respuesta = respuestas[actual.ciudad.id]
-  const conDatos = ciudades.filter((c) => respuestas[c.ciudad.id])
+
+  const periodo = `${etl.extraccion.config.fechaInicio}_${etl.extraccion.config.fechaFin}`
 
   return (
-    <div className="flex flex-col gap-4">
-      <p className="text-sm text-muted-foreground">
-        Respuesta original de la API, sin modificar. Se conserva en memoria durante la sesión y puede
-        descargarse completa. Observa que <code>hourly</code> contiene <strong>arrays paralelos</strong>: la
-        posición <em>i</em> de cada array corresponde a la hora <code>time[i]</code>.
-      </p>
-      <div className="flex flex-wrap items-center gap-2">
-        {ciudades.map((c) => (
-          <Button
-            key={c.ciudad.id}
-            size="sm"
-            variant={c.ciudad.id === actual.ciudad.id ? "default" : "outline"}
-            onClick={() => setElegida(c.ciudad.id)}
-            aria-pressed={c.ciudad.id === actual.ciudad.id}
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-wrap items-end gap-2">
+        <label className="flex flex-col gap-1.5 text-sm font-medium">
+          Ciudad
+          <Selector
+            value={actual?.ciudad ?? ""}
+            onChange={(e) => setElegida(e.target.value)}
           >
-            {c.ciudad.nombre}
-            {c.estado === "error" && " (error)"}
-          </Button>
-        ))}
-        <Button
-          size="sm"
-          variant="secondary"
-          className="ms-auto"
-          disabled={conDatos.length === 0}
-          onClick={() =>
-            descargarJson(
-              "open-meteo-original-todas.json",
-              Object.fromEntries(conDatos.map((c) => [c.ciudad.nombre, respuestas[c.ciudad.id]]))
-            )
-          }
-        >
-          <DownloadSimpleIcon data-icon="inline-start" />
-          Descargar todos
-        </Button>
-      </div>
-
-      <div className="flex flex-col gap-2 rounded-2xl border p-4">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h3 className="font-semibold">{actual.ciudad.nombre}</h3>
-          <Estado
-            estado={
-              actual.estado === "correcta"
-                ? "completada"
-                : actual.estado === "error"
-                  ? "error"
-                  : actual.estado === "descargando"
-                    ? "en_curso"
-                    : "pendiente"
+            {descargas.map((d) => (
+              <option key={d.ciudad} value={d.ciudad}>
+                {d.ciudad}
+                {d.estado === "error" ? " (error)" : ""}
+                {d.estado === "descargando" ? " (descargando…)" : ""}
+              </option>
+            ))}
+          </Selector>
+        </label>
+        {actual?.json && (
+          <Button
+            variant="outline"
+            onClick={() =>
+              descargarJson(
+                `open-meteo_${actual.ciudad}_${periodo}.json`,
+                actual.json
+              )
             }
-          />
-        </div>
-        <p className="font-mono text-xs break-all text-muted-foreground">
-          GET {actual.url}
-        </p>
-        {actual.error && <p className="text-sm text-destructive">{actual.error}</p>}
-        {respuesta ? (
-          <>
-            <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-              <span>
-                Coordenadas devueltas: {respuesta.latitude}, {respuesta.longitude} (celda de la rejilla del
-                modelo)
-              </span>
-              <span>Zona: {String(respuesta.timezone)}</span>
-              <span>Horas en time: {formatoEntero(respuesta.hourly?.time?.length ?? 0)}</span>
-              <Button
-                size="xs"
-                variant="outline"
-                className="ms-auto"
-                onClick={() =>
-                  descargarJson(`open-meteo-original-${actual.ciudad.id}.json`, respuesta)
-                }
-              >
-                <DownloadSimpleIcon data-icon="inline-start" />
-                Descargar JSON
-              </Button>
-            </div>
-            <pre
-              className={cn(
-                "max-h-[28rem] overflow-auto rounded-xl bg-muted/60 p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap"
-              )}
-              aria-label={`JSON original de ${actual.ciudad.nombre} (abreviado)`}
-            >
-              {jsonAbreviado(respuesta)}
-            </pre>
-            <p className="text-xs text-muted-foreground">
-              Vista abreviada: cada array muestra sus primeros {ELEMENTOS_VISIBLES} valores. La descarga
-              contiene el JSON completo.
-            </p>
-          </>
-        ) : (
-          !actual.error && <p className="text-sm text-muted-foreground">Aún no se ha recibido respuesta.</p>
+          >
+            <DownloadIcon aria-hidden />
+            Descargar JSON de {actual.ciudad}
+          </Button>
+        )}
+        {correctas.length > 1 && (
+          <Button
+            variant="outline"
+            onClick={() =>
+              descargarJson(
+                `open-meteo_todas_${periodo}.json`,
+                Object.fromEntries(correctas.map((d) => [d.ciudad, d.json]))
+              )
+            }
+          >
+            <DownloadIcon aria-hidden />
+            Descargar todos ({correctas.length})
+          </Button>
         )}
       </div>
+
+      <p className="text-xs text-muted-foreground">
+        Respuesta tal cual la devolvió la API, conservada en memoria durante
+        esta sesión. Fíjate en que <code>hourly</code> contiene{" "}
+        <strong>arrays paralelos</strong>: la posición <em>i</em> de cada array
+        corresponde a la hora <code>time[i]</code>. Se muestran las primeras{" "}
+        {MUESTRA} posiciones; descarga el archivo para verlo completo.
+      </p>
+
+      {actual?.json ? (
+        <pre className="max-h-[28rem] overflow-auto rounded-lg border bg-muted/40 p-3 font-mono text-xs leading-relaxed">
+          {resumirJson(actual.json)}
+        </pre>
+      ) : actual?.estado === "error" ? (
+        <SinDatos>
+          La descarga de {actual.ciudad} falló: {actual.error}
+        </SinDatos>
+      ) : (
+        <SinDatos>Esperando la respuesta de {actual?.ciudad}…</SinDatos>
+      )}
     </div>
   )
 }

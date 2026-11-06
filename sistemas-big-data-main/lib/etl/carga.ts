@@ -1,142 +1,169 @@
-import { dividirEnLotes } from "./filtrado"
-import { claveRegistro } from "./limpieza"
-import type { Registro } from "./tipos"
+import { claveDe, type RegistroCarga } from "./tipos"
 
+/** Máximo de registros por petición al servidor (y por upsert en Supabase). */
 export const TAMANO_LOTE = 500
 
-export type EstadoVerificacion =
-  | { estado: "pendiente" }
-  | { estado: "verificando" }
-  | { estado: "correcta"; encontrados: number }
-  | { estado: "incompleta"; encontrados: number; faltan: string[] }
-  | { estado: "error"; error: string }
+export type EstadoLote = "pendiente" | "enviando" | "completado" | "error"
 
-export type Lote = {
+export interface Lote {
   numero: number
-  /** Copia congelada de los registros del lote, en el orden de la vista previa. */
-  registros: readonly Registro[]
-  estado: "pendiente" | "enviando" | "correcto" | "error"
-  intentos: number
-  /** Filas afectadas según Supabase (inserciones + actualizaciones, no distinguibles). */
+  registros: readonly RegistroCarga[]
+  estado: EstadoLote
+  /** Filas que Supabase devolvió como insertadas o actualizadas. */
   procesados: number | null
   error: string | null
   duracionMs: number | null
-  verificacion: EstadoVerificacion
+  intentos: number
 }
 
+export interface ResultadoEnvio {
+  procesados: number
+}
+
+export type EnviarLote = (
+  registros: readonly RegistroCarga[]
+) => Promise<ResultadoEnvio>
+
 /**
- * Congela el conjunto seleccionado y su orden. A partir de aquí los cambios de
- * filtros o de selección en la interfaz no afectan a la carga.
+ * Congela una copia del conjunto seleccionado y la divide en lotes. A partir
+ * de aquí los cambios de filtros o selección no afectan a la carga.
  */
-export function prepararLotes(registros: Registro[], tamano = TAMANO_LOTE): Lote[] {
+export function crearLotes(
+  registros: readonly RegistroCarga[],
+  tamano = TAMANO_LOTE
+): Lote[] {
   const copia = registros.map((r) => Object.freeze({ ...r }))
-  return dividirEnLotes(copia, tamano).map((grupo, i) => ({
-    numero: i + 1,
-    registros: Object.freeze(grupo),
-    estado: "pendiente",
-    intentos: 0,
-    procesados: null,
-    error: null,
-    duracionMs: null,
-    verificacion: { estado: "pendiente" },
-  }))
-}
-
-export type EnviarLote = (registros: readonly Registro[]) => Promise<{ procesados: number | null }>
-/** Devuelve las claves (ciudad|fecha_hora) que existen en destino. */
-export type VerificarLote = (registros: readonly Registro[]) => Promise<string[]>
-
-/**
- * Envía en orden los lotes pendientes o fallidos (los correctos no se repiten)
- * y después verifica en destino los lotes enviados correctamente.
- * Si un lote falla se anota el error y se continúa con el siguiente; el upsert
- * por (ciudad, fecha_hora) hace que reintentar no duplique filas.
- */
-export async function ejecutarCarga(
-  lotesIniciales: Lote[],
-  enviar: EnviarLote,
-  verificar: VerificarLote,
-  alCambiar: (lotes: Lote[]) => void
-): Promise<Lote[]> {
-  let lotes = lotesIniciales
-  const actualizar = (i: number, cambios: Partial<Lote>) => {
-    lotes = lotes.map((l, j) => (j === i ? { ...l, ...cambios } : l))
-    alCambiar(lotes)
-  }
-
-  for (let i = 0; i < lotes.length; i++) {
-    if (lotes[i].estado === "correcto") continue
-    actualizar(i, { estado: "enviando", error: null, verificacion: { estado: "pendiente" } })
-    const inicio = performance.now()
-    try {
-      const { procesados } = await enviar(lotes[i].registros)
-      actualizar(i, {
-        estado: "correcto",
-        procesados,
-        intentos: lotes[i].intentos + 1,
-        duracionMs: performance.now() - inicio,
-      })
-    } catch (error) {
-      actualizar(i, {
-        estado: "error",
-        error: error instanceof Error ? error.message : String(error),
-        intentos: lotes[i].intentos + 1,
-        duracionMs: performance.now() - inicio,
-      })
-    }
-  }
-
-  for (let i = 0; i < lotes.length; i++) {
-    const lote = lotes[i]
-    if (lote.estado !== "correcto" || lote.verificacion.estado === "correcta") continue
-    actualizar(i, { verificacion: { estado: "verificando" } })
-    try {
-      const existentes = new Set(await verificar(lote.registros))
-      const faltan = lote.registros.map(claveRegistro).filter((c) => !existentes.has(c))
-      const encontrados = lote.registros.length - faltan.length
-      actualizar(i, {
-        verificacion:
-          faltan.length === 0
-            ? { estado: "correcta", encontrados }
-            : { estado: "incompleta", encontrados, faltan },
-      })
-    } catch (error) {
-      actualizar(i, {
-        verificacion: {
-          estado: "error",
-          error: error instanceof Error ? error.message : String(error),
-        },
-      })
-    }
+  const lotes: Lote[] = []
+  for (let i = 0; i < copia.length; i += tamano) {
+    lotes.push({
+      numero: lotes.length + 1,
+      registros: Object.freeze(copia.slice(i, i + tamano)),
+      estado: "pendiente",
+      procesados: null,
+      error: null,
+      duracionMs: null,
+      intentos: 0,
+    })
   }
   return lotes
 }
 
-export function resumirCarga(lotes: Lote[]) {
-  let enviadosOk = 0
-  let fallidos = 0
-  let verificados = 0
-  let procesadosSegunSupabase: number | null = 0
-  for (const l of lotes) {
-    if (l.estado === "correcto") {
-      enviadosOk += l.registros.length
-      procesadosSegunSupabase =
-        procesadosSegunSupabase === null || l.procesados === null
-          ? null
-          : procesadosSegunSupabase + l.procesados
+/**
+ * Envía en serie los lotes indicados (por defecto, los que no están
+ * completados). Un fallo no detiene el resto: cada lote es un upsert
+ * independiente e idempotente. Devuelve el estado final de todos los lotes.
+ */
+export async function ejecutarLotes(
+  lotes: readonly Lote[],
+  enviar: EnviarLote,
+  alActualizar: (lote: Lote) => void = () => {},
+  ahora: () => number = () => performance.now()
+): Promise<Lote[]> {
+  const resultado = [...lotes]
+  for (let i = 0; i < resultado.length; i++) {
+    const lote = resultado[i]
+    if (lote.estado === "completado") continue
+
+    const enviando: Lote = {
+      ...lote,
+      estado: "enviando",
+      error: null,
+      intentos: lote.intentos + 1,
     }
-    if (l.estado === "error") fallidos += l.registros.length
-    if (l.verificacion.estado === "correcta" || l.verificacion.estado === "incompleta")
-      verificados += l.verificacion.encontrados
+    resultado[i] = enviando
+    alActualizar(enviando)
+
+    const inicio = ahora()
+    try {
+      const { procesados } = await enviar(lote.registros)
+      resultado[i] = {
+        ...enviando,
+        estado: "completado",
+        procesados,
+        duracionMs: ahora() - inicio,
+      }
+    } catch (error) {
+      resultado[i] = {
+        ...enviando,
+        estado: "error",
+        procesados: null,
+        error: (error as Error).message,
+        duracionMs: ahora() - inicio,
+      }
+    }
+    alActualizar(resultado[i])
   }
-  return {
-    total: lotes.reduce((n, l) => n + l.registros.length, 0),
-    enviadosOk,
-    fallidos,
-    verificados,
-    // Sin lotes correctos no hay ningún recuento de Supabase que mostrar.
-    procesadosSegunSupabase: enviadosOk === 0 ? null : procesadosSegunSupabase,
-    lotesFallidos: lotes.filter((l) => l.estado === "error").length,
-    enCurso: lotes.some((l) => l.estado === "enviando" || l.verificacion.estado === "verificando"),
+  return resultado
+}
+
+export interface ResumenCarga {
+  total: number
+  completados: number
+  fallidos: number
+  pendientes: number
+  lotesFallidos: number
+}
+
+export function resumirCarga(lotes: readonly Lote[]): ResumenCarga {
+  const resumen: ResumenCarga = {
+    total: 0,
+    completados: 0,
+    fallidos: 0,
+    pendientes: 0,
+    lotesFallidos: 0,
   }
+  for (const l of lotes) {
+    resumen.total += l.registros.length
+    if (l.estado === "completado") resumen.completados += l.registros.length
+    else if (l.estado === "error") {
+      resumen.fallidos += l.registros.length
+      resumen.lotesFallidos++
+    } else resumen.pendientes += l.registros.length
+  }
+  return resumen
+}
+
+export interface ClaveRegistro {
+  ciudad: string
+  fecha_hora: string
+}
+
+export type ConsultarExistentes = (
+  claves: ClaveRegistro[]
+) => Promise<ClaveRegistro[]>
+
+export interface ResultadoVerificacion {
+  comprobadas: number
+  encontradas: number
+  faltantes: ClaveRegistro[]
+}
+
+/** Normaliza el timestamp que devuelve Postgres ("…+00:00") al formato ISO con Z. */
+export function normalizarFecha(valor: string) {
+  return new Date(valor).toISOString()
+}
+
+/** Comprueba, en lotes, que las claves enviadas existen en destino. */
+export async function verificarClaves(
+  claves: readonly ClaveRegistro[],
+  consultar: ConsultarExistentes,
+  tamano = TAMANO_LOTE
+): Promise<ResultadoVerificacion> {
+  const faltantes: ClaveRegistro[] = []
+  let encontradas = 0
+  for (let i = 0; i < claves.length; i += tamano) {
+    const lote = claves.slice(i, i + tamano)
+    const existentes = await consultar(lote)
+    const conjunto = new Set(
+      existentes.map((e) => claveDe(e.ciudad, normalizarFecha(e.fecha_hora)))
+    )
+    for (const c of lote) {
+      if (conjunto.has(claveDe(c.ciudad, normalizarFecha(c.fecha_hora)))) {
+        encontradas++
+      } else {
+        faltantes.push(c)
+      }
+    }
+  }
+  return { comprobadas: claves.length, encontradas, faltantes }
 }

@@ -1,94 +1,185 @@
-import type { FilaTransformada, RespuestaOpenMeteo, ResultadoTransformacion } from "./tipos"
+import type { RegistroTransformado, RespuestaOpenMeteo } from "./tipos"
 
-// Open-Meteo devuelve las horas sin zona ("2026-09-01T00:00"). Como pedimos
-// timezone=UTC, añadimos la "Z" de forma explícita en lugar de dejar que el
-// navegador las interprete como hora local.
-const PATRON_HORA_OPEN_METEO = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/
+/** Correspondencia entre las variables de Open-Meteo y las columnas normalizadas. */
+export const MAPA_VARIABLES = {
+  temperature_2m: "temperatura_c",
+  relative_humidity_2m: "humedad_pct",
+  precipitation: "precipitacion_mm",
+} as const
 
-/** Normaliza una hora de Open-Meteo a ISO 8601 UTC ("2026-09-01T00:00:00Z"). */
-export function normalizarFechaUtc(valor: unknown): string | null {
-  if (typeof valor !== "string") return null
-  const m = PATRON_HORA_OPEN_METEO.exec(valor)
-  if (!m) return null
-  const iso = `${valor}:00Z`
-  const ms = Date.parse(iso)
-  if (Number.isNaN(ms)) return null
-  // Evita fechas imposibles que Date "corrige" (31 de septiembre, 25:00…).
-  if (new Date(ms).toISOString().slice(0, 16) !== valor) return null
-  return iso
+type VariableApi = keyof typeof MAPA_VARIABLES
+
+export interface DiagnosticoTransformacion {
+  ciudad: string
+  /** Longitud de cada array recibido; null si el array no existe. */
+  longitudes: Record<"time" | VariableApi, number | null>
+  coherente: boolean
+  /** Problemas a nivel de respuesta (no de fila). */
+  avisos: string[]
+  /** Desplazamiento UTC declarado por la API, en segundos. */
+  desfaseUtc: number
+  registrosGenerados: number
 }
 
+export interface ResultadoTransformacion {
+  registros: RegistroTransformado[]
+  diagnostico: DiagnosticoTransformacion
+}
+
+const PATRON_HORA_LOCAL = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/
+
 /**
- * Convierte los arrays paralelos de `hourly` en una fila por ciudad y hora.
- *
- * No limpia ni convierte valores: un null sigue siendo null y una cadena sigue
- * siendo cadena. Si los arrays tienen longitudes distintas se genera una fila
- * por cada posición del array más largo; las posiciones que faltan quedan como
- * `undefined` y la fase de limpieza las rechaza indicando el motivo.
+ * Open-Meteo devuelve "AAAA-MM-DDTHH:MM" sin zona horaria. La hora es local
+ * respecto a utc_offset_seconds, así que la convertimos a UTC de forma explícita
+ * en lugar de dejar que el navegador la interprete con su zona local.
  */
-export function transformarRespuesta(
+export function interpretarFechaUtc(
+  valor: unknown,
+  desfaseSegundos: number
+): string | null {
+  if (typeof valor !== "string") return null
+  const m = PATRON_HORA_LOCAL.exec(valor)
+  if (!m) return null
+  const [anio, mes, dia, hora, minuto] = m.slice(1).map(Number)
+  const ms = Date.UTC(anio, mes - 1, dia, hora, minuto)
+  const comprobacion = new Date(ms)
+  // Rechaza fechas imposibles como 2026-02-30T25:00, que Date.UTC "desborda".
+  if (
+    comprobacion.getUTCFullYear() !== anio ||
+    comprobacion.getUTCMonth() !== mes - 1 ||
+    comprobacion.getUTCDate() !== dia ||
+    comprobacion.getUTCHours() !== hora ||
+    comprobacion.getUTCMinutes() !== minuto
+  ) {
+    return null
+  }
+  return new Date(ms - desfaseSegundos * 1000).toISOString()
+}
+
+function describirTipo(valor: unknown): string {
+  if (valor === null) return "null"
+  if (valor === undefined) return "ausente"
+  if (valor === "") return "cadena vacía"
+  if (typeof valor === "string") return `texto "${valor.slice(0, 20)}"`
+  if (typeof valor === "number") return `número no finito (${valor})`
+  return `tipo ${typeof valor}`
+}
+
+/** Devuelve el número si es finito; nunca convierte null, "" o ausentes en 0. */
+export function leerNumero(
+  valor: unknown,
+  columna: string,
+  incidencias: string[]
+): number | null {
+  if (typeof valor === "number" && Number.isFinite(valor)) return valor
+  incidencias.push(`${columna}: ${describirTipo(valor)}`)
+  return null
+}
+
+function comoArray(valor: unknown): unknown[] | null {
+  return Array.isArray(valor) ? valor : null
+}
+
+/** Convierte los arrays paralelos de una ciudad en un registro por hora. */
+export function transformarCiudad(
   ciudad: string,
   respuesta: RespuestaOpenMeteo
 ): ResultadoTransformacion {
   const avisos: string[] = []
-  const hourly = respuesta.hourly
+  const hourly =
+    respuesta.hourly && typeof respuesta.hourly === "object"
+      ? respuesta.hourly
+      : null
+  if (!hourly) avisos.push("La respuesta no contiene el bloque 'hourly'.")
 
-  // Si la API no respondiera en UTC no podríamos añadir la "Z" sin falsear la
-  // hora: en ese caso ninguna fecha se considera interpretable.
-  const esUtc = respuesta.utc_offset_seconds === undefined || respuesta.utc_offset_seconds === 0
-  if (!esUtc) {
+  let desfaseUtc = 0
+  if (typeof respuesta.utc_offset_seconds === "number") {
+    desfaseUtc = respuesta.utc_offset_seconds
+    if (desfaseUtc !== 0) {
+      avisos.push(
+        `La API declara un desfase de ${desfaseUtc} s; se ha restado para obtener UTC.`
+      )
+    }
+  } else {
     avisos.push(
-      `La respuesta no está en UTC (utc_offset_seconds = ${String(respuesta.utc_offset_seconds)}); se rechazan sus fechas.`
-    )
-  }
-  if (!hourly || typeof hourly !== "object") {
-    avisos.push("La respuesta no contiene el bloque `hourly`.")
-    return { filas: [], avisos }
-  }
-
-  const arrays = {
-    time: hourly.time,
-    temperature_2m: hourly.temperature_2m,
-    relative_humidity_2m: hourly.relative_humidity_2m,
-    precipitation: hourly.precipitation,
-  }
-  for (const [nombre, valor] of Object.entries(arrays)) {
-    if (!Array.isArray(valor)) avisos.push(`Falta el array \`${nombre}\` o no es un array.`)
-  }
-
-  const longitudes = Object.entries(arrays).map(
-    ([nombre, valor]) => [nombre, Array.isArray(valor) ? valor.length : 0] as const
-  )
-  const total = Math.max(0, ...longitudes.map(([, n]) => n))
-  if (new Set(longitudes.map(([, n]) => n)).size > 1) {
-    avisos.push(
-      "Longitudes incoherentes: " +
-        longitudes.map(([nombre, n]) => `${nombre}=${n}`).join(", ") +
-        ". Las posiciones sin valor se rechazarán en la limpieza."
+      "La respuesta no declara utc_offset_seconds; se asume UTC porque así se solicitó."
     )
   }
 
-  const en = (array: unknown[] | undefined, i: number) =>
-    Array.isArray(array) && i < array.length ? array[i] : undefined
+  const time = comoArray(hourly?.time)
+  const series = {
+    temperature_2m: comoArray(hourly?.temperature_2m),
+    relative_humidity_2m: comoArray(hourly?.relative_humidity_2m),
+    precipitation: comoArray(hourly?.precipitation),
+  }
 
-  const filas: FilaTransformada[] = []
-  for (let i = 0; i < total; i++) {
-    const fechaOriginal = en(arrays.time, i)
-    filas.push({
+  const longitudes = {
+    time: time?.length ?? null,
+    temperature_2m: series.temperature_2m?.length ?? null,
+    relative_humidity_2m: series.relative_humidity_2m?.length ?? null,
+    precipitation: series.precipitation?.length ?? null,
+  }
+  for (const [nombre, longitud] of Object.entries(longitudes)) {
+    if (hourly && longitud === null) {
+      avisos.push(`Falta el array hourly.${nombre}.`)
+    }
+  }
+  const valoresLongitud = Object.values(longitudes)
+  const coherente =
+    valoresLongitud.every((l) => l !== null) &&
+    new Set(valoresLongitud).size === 1
+  if (hourly && !coherente) {
+    avisos.push(
+      "Los arrays no tienen la misma longitud: las posiciones sin valor se marcan como ausentes y se rechazarán en la limpieza."
+    )
+  }
+
+  // Recorremos hasta la longitud máxima para no perder ningún valor en silencio.
+  const n = Math.max(0, ...valoresLongitud.map((l) => l ?? 0))
+  const nombreCiudad = ciudad.trim() === "" ? null : ciudad
+  const registros: RegistroTransformado[] = []
+
+  for (let i = 0; i < n; i++) {
+    const incidencias: string[] = []
+    const fechaOriginal = time?.[i]
+    const fecha_hora = interpretarFechaUtc(fechaOriginal, desfaseUtc)
+    if (fecha_hora === null) {
+      incidencias.push(`fecha_hora: ${describirTipo(fechaOriginal)}`)
+    }
+    registros.push({
+      idLocal: `${ciudad}#${i}`,
+      ciudad: nombreCiudad,
       indice: i,
-      ciudad: ciudad.trim() === "" ? null : ciudad,
-      fecha_hora: esUtc ? normalizarFechaUtc(fechaOriginal) : null,
-      fecha_original: fechaOriginal,
-      temperatura_c: en(arrays.temperature_2m, i),
-      humedad_pct: en(arrays.relative_humidity_2m, i),
-      precipitacion_mm: en(arrays.precipitation, i),
+      fechaOriginal,
+      fecha_hora,
+      temperatura_c: leerNumero(
+        series.temperature_2m?.[i],
+        "temperatura_c",
+        incidencias
+      ),
+      humedad_pct: leerNumero(
+        series.relative_humidity_2m?.[i],
+        "humedad_pct",
+        incidencias
+      ),
+      precipitacion_mm: leerNumero(
+        series.precipitation?.[i],
+        "precipitacion_mm",
+        incidencias
+      ),
+      incidencias,
     })
   }
-  return { filas, avisos }
-}
 
-/** Número de horas presentes en `time` (registros brutos recibidos). */
-export function contarHorasRecibidas(respuesta: RespuestaOpenMeteo): number {
-  const time = respuesta.hourly?.time
-  return Array.isArray(time) ? time.length : 0
+  return {
+    registros,
+    diagnostico: {
+      ciudad,
+      longitudes,
+      coherente,
+      avisos,
+      desfaseUtc,
+      registrosGenerados: registros.length,
+    },
+  }
 }

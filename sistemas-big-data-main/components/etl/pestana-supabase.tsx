@@ -1,248 +1,369 @@
 "use client"
 
-import { ArrowClockwiseIcon, DatabaseIcon } from "@phosphor-icons/react"
-import { useCallback, useEffect, useState } from "react"
+import * as React from "react"
+import {
+  DatabaseIcon,
+  HardDriveIcon,
+  RefreshCwIcon,
+  XCircleIcon,
+} from "lucide-react"
 
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
-import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import type { PipelineEtl } from "@/hooks/use-pipeline-etl"
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
-import { CIUDADES } from "@/lib/etl/extraccion"
+  consultarDatos,
+  type FilaPersistida,
+  type ParametrosDatos,
+} from "@/lib/etl/api-cliente"
+import { NOMBRES_CIUDADES } from "@/lib/etl/ciudades"
+import { claveDe } from "@/lib/etl/tipos"
 
 import {
+  entradaUtcAIso,
   formatoEntero,
   formatoFechaUtc,
   formatoNumero,
-  Paginacion,
-  SelectorNativo,
-  Vacio,
-} from "./comunes"
+} from "./formato"
+import { Selector } from "./selector"
 
-type Fila = {
-  id: number
-  ciudad: string
-  fecha_hora: string
-  temperatura_c: number
-  humedad_pct: number
-  precipitacion_mm: number
-  importado_en: string
+const ORDENES = {
+  fecha_hora: "Fecha y hora (UTC)",
+  ciudad: "Ciudad",
+  temperatura_c: "Temperatura (°C)",
+  humedad_pct: "Humedad (%)",
+  precipitacion_mm: "Precipitación (mm)",
+  importado_en: "Importado en",
+  id: "id",
 }
 
-const CAMPOS = [
-  ["fecha_hora", "Fecha y hora (UTC)"],
-  ["ciudad", "Ciudad"],
-  ["temperatura_c", "Temperatura (°C)"],
-  ["humedad_pct", "Humedad (%)"],
-  ["precipitacion_mm", "Precipitación (mm)"],
-  ["importado_en", "Importado en"],
-] as const
+interface Formulario {
+  ciudad: string
+  desde: string
+  hasta: string
+  orden: string
+  direccion: "asc" | "desc"
+  tamano: number
+}
 
-export function PestanaSupabase({
-  activa,
-  version,
-  pendientesLocales,
-}: {
-  activa: boolean
-  version: number
-  pendientesLocales: number
-}) {
-  const [ciudades, setCiudades] = useState<string[]>([])
-  const [desde, setDesde] = useState("")
-  const [hasta, setHasta] = useState("")
-  const [orden, setOrden] = useState("fecha_hora")
-  const [direccion, setDireccion] = useState<"asc" | "desc">("asc")
-  const [pagina, setPagina] = useState(1)
-  const [tamano, setTamano] = useState(25)
+const INICIAL: Formulario = {
+  ciudad: "",
+  desde: "",
+  hasta: "",
+  orden: "fecha_hora",
+  direccion: "asc",
+  tamano: 25,
+}
 
-  const [datos, setDatos] = useState<{ total: number; filas: Fila[] } | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [cargando, setCargando] = useState(false)
-  const [leidoEn, setLeidoEn] = useState<Date | null>(null)
+export function PestanaSupabase({ etl }: { etl: PipelineEtl }) {
+  const [form, setForm] = React.useState(INICIAL)
+  const [pagina, setPagina] = React.useState(1)
+  const [resultado, setResultado] = React.useState<{
+    filas: FilaPersistida[]
+    total: number
+    leidoEn: string
+  } | null>(null)
+  const [error, setError] = React.useState<string | null>(null)
+  const [cargando, setCargando] = React.useState(false)
+  const peticion = React.useRef(0)
 
-  const leer = useCallback(async () => {
-    const p = new URLSearchParams({ orden, dir: direccion, pagina: String(pagina), tam: String(tamano) })
-    for (const c of ciudades) p.append("ciudad", c)
-    if (desde) p.set("desde", `${desde}:00Z`)
-    if (hasta) p.set("hasta", `${hasta}:00Z`)
+  const leer = React.useCallback(async (p: ParametrosDatos) => {
+    const id = ++peticion.current
     setCargando(true)
+    setError(null)
     try {
-      const r = await fetch(`/api/mediciones?${p}`, { cache: "no-store" })
-      const cuerpo = await r.json()
-      if (!r.ok) throw new Error(`HTTP ${r.status}: ${cuerpo.error ?? "error desconocido"}`)
-      setDatos(cuerpo)
-      setError(null)
-      setLeidoEn(new Date())
+      const r = await consultarDatos(p)
+      // Descarta respuestas antiguas si el usuario cambió los filtros entretanto.
+      if (id === peticion.current) {
+        setResultado({ ...r, leidoEn: new Date().toISOString() })
+      }
     } catch (e) {
-      setDatos(null)
-      setError(e instanceof Error ? e.message : String(e))
+      if (id === peticion.current) setError((e as Error).message)
     } finally {
-      setCargando(false)
+      if (id === peticion.current) setCargando(false)
     }
-  }, [ciudades, desde, hasta, orden, direccion, pagina, tamano])
+  }, [])
 
-  useEffect(() => {
-    // Lectura real del destino al abrir la pestaña, al cambiar la consulta y tras cada carga.
+  const parametros: ParametrosDatos = {
+    ciudad: form.ciudad,
+    desde: entradaUtcAIso(form.desde),
+    hasta: entradaUtcAIso(form.hasta),
+    orden: form.orden,
+    direccion: form.direccion,
+    tamano: form.tamano,
+    pagina,
+  }
+  const claveParametros = JSON.stringify(parametros)
+  const tablaAccesible = etl.estadoSupabase?.tablaAccesible
+
+  React.useEffect(() => {
+    if (!tablaAccesible) return
+    // Lectura de un sistema externo (Supabase) cuando cambian los parámetros.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (activa) void leer()
-  }, [activa, leer, version])
+    void leer(JSON.parse(claveParametros))
+  }, [claveParametros, leer, tablaAccesible])
 
-  const totalPaginas = Math.max(1, Math.ceil((datos?.total ?? 0) / tamano))
+  const cambiar = <K extends keyof Formulario>(k: K, v: Formulario[K]) => {
+    setForm((f) => ({ ...f, [k]: v }))
+    setPagina(1)
+  }
+
+  // Datos locales todavía no confirmados en destino.
+  const confirmadas = new Set(
+    (etl.carga?.lotes ?? [])
+      .filter((l) => l.estado === "completado")
+      .flatMap((l) => l.registros.map((r) => claveDe(r.ciudad, r.fecha_hora)))
+  )
+  const pendientesLocales = etl.conjuntoCarga.registros.filter(
+    (r) => !confirmadas.has(r.clave)
+  ).length
+
+  const totalPaginas = resultado
+    ? Math.max(1, Math.ceil(resultado.total / form.tamano))
+    : 1
 
   return (
     <div className="flex flex-col gap-4">
-      <Alert>
-        <DatabaseIcon />
-        <AlertTitle>Datos persistidos en Supabase</AlertTitle>
-        <AlertDescription>
-          Esta tabla se lee de la base de datos real (<code>mediciones_meteorologicas</code>) a través del
-          servidor. No incluye los {formatoEntero(pendientesLocales)} registros locales seleccionados que solo
-          existen en tu navegador hasta que los subas.
-        </AlertDescription>
-      </Alert>
-
-      <section aria-label="Filtros de la consulta" className="grid gap-4 rounded-2xl border p-4 md:grid-cols-2 xl:grid-cols-4">
-        <fieldset className="flex flex-col gap-2">
-          <legend className="mb-1.5 text-sm font-medium">Ciudades</legend>
-          <div className="flex flex-wrap gap-x-4 gap-y-2">
-            {CIUDADES.map((c) => (
-              <Label key={c.id} className="flex items-center gap-2 font-normal">
-                <Checkbox
-                  checked={ciudades.includes(c.nombre)}
-                  onCheckedChange={(v) => {
-                    setCiudades(v ? [...ciudades, c.nombre] : ciudades.filter((n) => n !== c.nombre))
-                    setPagina(1)
-                  }}
-                />
-                {c.nombre}
-              </Label>
-            ))}
+      <div className="grid gap-2 @xl:grid-cols-2">
+        <div className="flex gap-3 rounded-lg border border-dashed p-3 text-sm">
+          <HardDriveIcon
+            className="mt-0.5 size-5 shrink-0 text-muted-foreground"
+            aria-hidden
+          />
+          <div>
+            <p className="font-medium">Local (solo en tu navegador)</p>
+            <p className="text-muted-foreground">
+              {formatoEntero(pendientesLocales)} registros seleccionados
+              pendientes de subir. No existen en Supabase hasta que su lote se
+              confirme.
+            </p>
           </div>
-        </fieldset>
-        <fieldset className="flex flex-col gap-1.5">
-          <legend className="mb-1.5 text-sm font-medium">
-            Fechas <span className="font-normal text-muted-foreground">(UTC)</span>
-          </legend>
-          <Input
-            type="datetime-local"
-            step={3600}
-            aria-label="Desde (UTC)"
-            value={desde}
-            onChange={(e) => {
-              setDesde(e.target.value.slice(0, 16))
-              setPagina(1)
-            }}
-          />
-          <Input
-            type="datetime-local"
-            step={3600}
-            aria-label="Hasta (UTC)"
-            value={hasta}
-            onChange={(e) => {
-              setHasta(e.target.value.slice(0, 16))
-              setPagina(1)
-            }}
-          />
-        </fieldset>
-        <fieldset className="flex flex-col gap-1.5">
-          <legend className="mb-1.5 text-sm font-medium">ORDER BY</legend>
-          <SelectorNativo
-            aria-label="Campo de ordenación"
-            value={orden}
-            onChange={(e) => {
-              setOrden(e.target.value)
-              setPagina(1)
-            }}
-          >
-            {CAMPOS.map(([campo, titulo]) => (
-              <option key={campo} value={campo}>
-                {titulo}
-              </option>
-            ))}
-          </SelectorNativo>
-          <SelectorNativo
-            aria-label="Dirección"
-            value={direccion}
-            onChange={(e) => {
-              setDireccion(e.target.value as "asc" | "desc")
-              setPagina(1)
-            }}
-          >
-            <option value="asc">Ascendente</option>
-            <option value="desc">Descendente</option>
-          </SelectorNativo>
-        </fieldset>
-        <div className="flex flex-col justify-end gap-2">
-          <Button onClick={() => void leer()} disabled={cargando}>
-            <ArrowClockwiseIcon data-icon="inline-start" className={cargando ? "animate-spin" : undefined} />
-            {cargando ? "Leyendo…" : "Actualizar"}
-          </Button>
-          <span className="text-xs text-muted-foreground" aria-live="polite">
-            {leidoEn ? `Última lectura: ${leidoEn.toLocaleTimeString("es-ES")}` : "Sin leer todavía"}
-            {datos && ` · ${formatoEntero(datos.total)} filas en destino con estos filtros`}
-          </span>
         </div>
-      </section>
-
-      {error && (
-        <Alert variant="destructive">
-          <AlertTitle>No se pudo leer Supabase</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      )}
-
-      {datos && datos.filas.length === 0 && <Vacio>La consulta no devuelve filas persistidas.</Vacio>}
-
-      {datos && datos.filas.length > 0 && (
-        <>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="text-end">id</TableHead>
-                <TableHead>Ciudad</TableHead>
-                <TableHead>Fecha y hora (UTC)</TableHead>
-                <TableHead className="text-end">Temperatura (°C)</TableHead>
-                <TableHead className="text-end">Humedad (%)</TableHead>
-                <TableHead className="text-end">Precipitación (mm)</TableHead>
-                <TableHead>Importado en (UTC)</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {datos.filas.map((f) => (
-                <TableRow key={f.id}>
-                  <TableCell className="text-end tabular-nums">{f.id}</TableCell>
-                  <TableCell>{f.ciudad}</TableCell>
-                  <TableCell className="tabular-nums">{formatoFechaUtc(f.fecha_hora)}</TableCell>
-                  <TableCell className="text-end tabular-nums">{formatoNumero(f.temperatura_c)}</TableCell>
-                  <TableCell className="text-end tabular-nums">{formatoNumero(f.humedad_pct)}</TableCell>
-                  <TableCell className="text-end tabular-nums">{formatoNumero(f.precipitacion_mm)}</TableCell>
-                  <TableCell className="text-xs tabular-nums">
-                    {formatoFechaUtc(new Date(f.importado_en).toISOString())}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-          <Paginacion
-            pagina={Math.min(pagina, totalPaginas)}
-            totalPaginas={totalPaginas}
-            total={datos.total}
-            tamano={tamano}
-            etiqueta="filas persistidas"
-            onPagina={setPagina}
-            onTamano={(t) => {
-              setTamano(t)
-              setPagina(1)
-            }}
+        <div className="flex gap-3 rounded-lg border p-3 text-sm">
+          <DatabaseIcon
+            className="mt-0.5 size-5 shrink-0 text-muted-foreground"
+            aria-hidden
           />
+          <div>
+            <p className="font-medium">Persistido en Supabase</p>
+            <p className="text-muted-foreground">
+              {resultado
+                ? `${formatoEntero(resultado.total)} filas cumplen esta consulta (leído ${new Date(resultado.leidoEn).toLocaleTimeString("es-ES")}).`
+                : (etl.estadoSupabase?.mensaje ?? "Comprobando conexión…")}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {!tablaAccesible ? (
+        <Alert variant="destructive">
+          <XCircleIcon aria-hidden />
+          <AlertDescription>
+            {etl.estadoSupabase?.mensaje ?? "Comprobando conexión…"}{" "}
+            <Button
+              variant="link"
+              className="h-auto p-0"
+              onClick={() => void etl.refrescarEstadoSupabase()}
+            >
+              Comprobar de nuevo
+            </Button>
+          </AlertDescription>
+        </Alert>
+      ) : (
+        <>
+          <div className="flex flex-wrap items-end gap-3">
+            <label className="flex flex-col gap-1.5 text-sm font-medium">
+              Ciudad
+              <Selector
+                value={form.ciudad}
+                onChange={(e) => cambiar("ciudad", e.target.value)}
+              >
+                <option value="">Todas</option>
+                {NOMBRES_CIUDADES.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </Selector>
+            </label>
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="sb-desde">Desde (UTC)</Label>
+              <Input
+                id="sb-desde"
+                type="datetime-local"
+                value={form.desde}
+                onChange={(e) => cambiar("desde", e.target.value)}
+                className="w-auto"
+              />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="sb-hasta">Hasta (UTC)</Label>
+              <Input
+                id="sb-hasta"
+                type="datetime-local"
+                value={form.hasta}
+                onChange={(e) => cambiar("hasta", e.target.value)}
+                className="w-auto"
+              />
+            </div>
+            <label className="flex flex-col gap-1.5 text-sm font-medium">
+              ORDER BY
+              <Selector
+                value={form.orden}
+                onChange={(e) => cambiar("orden", e.target.value)}
+              >
+                {Object.entries(ORDENES).map(([v, t]) => (
+                  <option key={v} value={v}>
+                    {t}
+                  </option>
+                ))}
+              </Selector>
+            </label>
+            <label className="flex flex-col gap-1.5 text-sm font-medium">
+              Dirección
+              <Selector
+                value={form.direccion}
+                onChange={(e) =>
+                  cambiar("direccion", e.target.value as "asc" | "desc")
+                }
+              >
+                <option value="asc">Ascendente</option>
+                <option value="desc">Descendente</option>
+              </Selector>
+            </label>
+            <Button
+              variant="outline"
+              onClick={() => {
+                void leer(parametros)
+                void etl.refrescarEstadoSupabase()
+              }}
+              disabled={cargando}
+            >
+              <RefreshCwIcon
+                className={cargando ? "animate-spin" : undefined}
+                aria-hidden
+              />
+              Actualizar
+            </Button>
+          </div>
+
+          {error && (
+            <Alert variant="destructive">
+              <XCircleIcon aria-hidden />
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          )}
+
+          <div
+            className="overflow-x-auto rounded-lg border"
+            aria-busy={cargando}
+          >
+            <table className="w-full text-sm">
+              <caption className="sr-only">
+                Filas almacenadas en Supabase
+              </caption>
+              <thead className="bg-muted/50 text-left">
+                <tr className="border-b">
+                  <th scope="col" className="p-2 text-right font-medium">
+                    id
+                  </th>
+                  <th scope="col" className="p-2 font-medium">
+                    Ciudad
+                  </th>
+                  <th scope="col" className="p-2 font-medium">
+                    Fecha y hora (UTC)
+                  </th>
+                  <th scope="col" className="p-2 text-right font-medium">
+                    Temperatura (°C)
+                  </th>
+                  <th scope="col" className="p-2 text-right font-medium">
+                    Humedad (%)
+                  </th>
+                  <th scope="col" className="p-2 text-right font-medium">
+                    Precipitación (mm)
+                  </th>
+                  <th scope="col" className="p-2 font-medium">
+                    Importado en (UTC)
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {resultado?.filas.length === 0 && (
+                  <tr>
+                    <td
+                      colSpan={7}
+                      className="h-20 text-center text-muted-foreground"
+                    >
+                      La consulta no devuelve filas.
+                    </td>
+                  </tr>
+                )}
+                {resultado?.filas.map((f) => (
+                  <tr key={f.id} className="border-b last:border-0">
+                    <td className="p-2 text-right tabular-nums">{f.id}</td>
+                    <td className="p-2">{f.ciudad}</td>
+                    <td className="p-2 whitespace-nowrap">
+                      {formatoFechaUtc(f.fecha_hora)}
+                    </td>
+                    <td className="p-2 text-right tabular-nums">
+                      {formatoNumero(f.temperatura_c)}
+                    </td>
+                    <td className="p-2 text-right tabular-nums">
+                      {formatoNumero(f.humedad_pct)}
+                    </td>
+                    <td className="p-2 text-right tabular-nums">
+                      {formatoNumero(f.precipitacion_mm)}
+                    </td>
+                    <td className="p-2 whitespace-nowrap">
+                      {formatoFechaUtc(f.importado_en)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+            <span>
+              {resultado && `${formatoEntero(resultado.total)} filas en total`}
+            </span>
+            <div className="flex items-center gap-2">
+              <label className="flex items-center gap-1.5">
+                Filas por página
+                <Selector
+                  value={form.tamano}
+                  onChange={(e) => cambiar("tamano", Number(e.target.value))}
+                >
+                  {[25, 50, 100].map((t) => (
+                    <option key={t} value={t}>
+                      {t}
+                    </option>
+                  ))}
+                </Selector>
+              </label>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={pagina <= 1 || cargando}
+                onClick={() => setPagina((p) => p - 1)}
+              >
+                Anterior
+              </Button>
+              <span className="tabular-nums">
+                Página {pagina} de {totalPaginas}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={pagina >= totalPaginas || cargando}
+                onClick={() => setPagina((p) => p + 1)}
+              >
+                Siguiente
+              </Button>
+            </div>
+          </div>
         </>
       )}
     </div>

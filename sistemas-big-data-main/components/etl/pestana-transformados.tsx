@@ -1,94 +1,161 @@
 "use client"
 
-import { WarningIcon } from "@phosphor-icons/react"
-import { useState } from "react"
+import type { PipelineEtl } from "@/hooks/use-pipeline-etl"
+import type { RegistroTransformado } from "@/lib/etl/tipos"
 
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
-import { paginar } from "@/lib/etl/filtrado"
-import type { FilaTransformada } from "@/lib/etl/tipos"
+import { formatoEntero, formatoFechaUtc } from "./formato"
+import { SinDatos } from "./sin-datos"
+import { TablaPaginada, type Columna } from "./tabla-paginada"
 
-import { formatoFechaUtc, Paginacion, Vacio, ValorBruto } from "./comunes"
-
-export function PestanaTransformados({
-  filas,
-  avisos,
-}: {
-  filas: FilaTransformada[]
-  avisos: { ciudad: string; aviso: string }[]
-}) {
-  const [pagina, setPagina] = useState(1)
-  const [tamano, setTamano] = useState(25)
-  if (filas.length === 0 && avisos.length === 0) {
-    return <Vacio>No hay datos transformados todavía.</Vacio>
+/** Muestra null de forma visible: nunca como 0 ni como celda vacía. */
+export function Valor({ v }: { v: number | null }) {
+  if (v === null) {
+    return <span className="text-red-700 italic dark:text-red-300">null</span>
   }
-  const vista = paginar(filas, pagina, tamano)
+  return <>{v.toLocaleString("es-ES", { maximumFractionDigits: 2 })}</>
+}
+
+export const COLUMNAS_TRANSFORMADO: Columna<RegistroTransformado>[] = [
+  {
+    id: "ciudad",
+    titulo: "Ciudad",
+    celda: (r) => r.ciudad ?? <Valor v={null} />,
+  },
+  { id: "indice", titulo: "Posición", celda: (r) => r.indice, numerica: true },
+  {
+    id: "original",
+    titulo: "time (original)",
+    celda: (r) => (
+      <code className="text-xs">
+        {JSON.stringify(r.fechaOriginal) ?? "ausente"}
+      </code>
+    ),
+  },
+  {
+    id: "fecha",
+    titulo: "fecha_hora (UTC)",
+    celda: (r) =>
+      r.fecha_hora ? formatoFechaUtc(r.fecha_hora) : <Valor v={null} />,
+  },
+  {
+    id: "temp",
+    titulo: "temperatura_c (°C)",
+    celda: (r) => <Valor v={r.temperatura_c} />,
+    numerica: true,
+  },
+  {
+    id: "hum",
+    titulo: "humedad_pct (%)",
+    celda: (r) => <Valor v={r.humedad_pct} />,
+    numerica: true,
+  },
+  {
+    id: "prec",
+    titulo: "precipitacion_mm (mm)",
+    celda: (r) => <Valor v={r.precipitacion_mm} />,
+    numerica: true,
+  },
+  {
+    id: "incidencias",
+    titulo: "Incidencias",
+    celda: (r) =>
+      r.incidencias.length === 0 ? (
+        <span className="text-muted-foreground">—</span>
+      ) : (
+        <span className="text-xs whitespace-normal">
+          {r.incidencias.join("; ")}
+        </span>
+      ),
+  },
+]
+
+export function PestanaTransformados({ etl }: { etl: PipelineEtl }) {
+  const t = etl.procesado?.transformacion
+  if (!t) {
+    return <SinDatos>Aún no hay datos transformados.</SinDatos>
+  }
 
   return (
-    <div className="flex flex-col gap-3">
-      <p className="text-sm text-muted-foreground">
-        Cada posición de los arrays se convierte en un registro. La hora original (sin zona) se interpreta
-        explícitamente como UTC. Los valores se copian <strong>tal cual</strong>: un <code>null</code> sigue
-        siendo <code>null</code>; la limpieza decide después.
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-2">
+        <h3 className="text-sm font-medium">
+          Comprobación de arrays por ciudad
+        </h3>
+        <div className="overflow-x-auto rounded-lg border">
+          <table className="w-full text-sm">
+            <caption className="sr-only">
+              Longitud de cada array de la respuesta original
+            </caption>
+            <thead className="bg-muted/50 text-left">
+              <tr className="border-b">
+                <th scope="col" className="p-2 font-medium">
+                  Ciudad
+                </th>
+                <th scope="col" className="p-2 text-right font-medium">
+                  time
+                </th>
+                <th scope="col" className="p-2 text-right font-medium">
+                  temperature_2m
+                </th>
+                <th scope="col" className="p-2 text-right font-medium">
+                  relative_humidity_2m
+                </th>
+                <th scope="col" className="p-2 text-right font-medium">
+                  precipitation
+                </th>
+                <th scope="col" className="p-2 font-medium">
+                  Resultado
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {t.diagnosticos.map((d) => (
+                <tr key={d.ciudad} className="border-b last:border-0">
+                  <td className="p-2">{d.ciudad}</td>
+                  {(
+                    [
+                      "time",
+                      "temperature_2m",
+                      "relative_humidity_2m",
+                      "precipitation",
+                    ] as const
+                  ).map((k) => (
+                    <td key={k} className="p-2 text-right tabular-nums">
+                      {d.longitudes[k] === null
+                        ? "falta"
+                        : formatoEntero(d.longitudes[k])}
+                    </td>
+                  ))}
+                  <td className="p-2 text-xs">
+                    {d.coherente
+                      ? "✓ Longitudes coherentes"
+                      : "✗ Longitudes distintas"}
+                    {d.avisos.length > 0 && (
+                      <ul className="mt-1 list-disc pl-4 text-muted-foreground">
+                        {d.avisos.map((a) => (
+                          <li key={a}>{a}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <p className="text-xs text-muted-foreground">
+        Un registro por ciudad y hora. La hora original (sin zona) se interpreta
+        explícitamente como UTC usando <code>utc_offset_seconds</code>. Los
+        valores ausentes se muestran como <em>null</em>: no se convierten en 0.
       </p>
-      {avisos.length > 0 && (
-        <ul className="flex flex-col gap-1 rounded-2xl border border-destructive/40 p-3 text-sm text-destructive">
-          {avisos.map((a, i) => (
-            <li key={i} className="flex items-start gap-1.5">
-              <WarningIcon aria-hidden className="mt-0.5 shrink-0" weight="bold" />
-              <span>
-                <strong>{a.ciudad}:</strong> {a.aviso}
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead>Ciudad</TableHead>
-            <TableHead className="text-end">Índice en arrays</TableHead>
-            <TableHead>time (original)</TableHead>
-            <TableHead>fecha_hora (UTC)</TableHead>
-            <TableHead className="text-end">Temperatura (°C)</TableHead>
-            <TableHead className="text-end">Humedad (%)</TableHead>
-            <TableHead className="text-end">Precipitación (mm)</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {vista.filas.map((f) => (
-            <TableRow key={`${f.ciudad}-${f.indice}`}>
-              <TableCell>{f.ciudad ?? <ValorBruto valor={null} />}</TableCell>
-              <TableCell className="text-end tabular-nums">{f.indice}</TableCell>
-              <TableCell className="font-mono text-xs">
-                <ValorBruto valor={f.fecha_original} />
-              </TableCell>
-              <TableCell className="tabular-nums">
-                {f.fecha_hora ? formatoFechaUtc(f.fecha_hora) : <span className="text-destructive">no válida</span>}
-              </TableCell>
-              <TableCell className="text-end"><ValorBruto valor={f.temperatura_c} /></TableCell>
-              <TableCell className="text-end"><ValorBruto valor={f.humedad_pct} /></TableCell>
-              <TableCell className="text-end"><ValorBruto valor={f.precipitacion_mm} /></TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-      <Paginacion
-        pagina={vista.pagina}
-        totalPaginas={vista.totalPaginas}
-        total={filas.length}
-        tamano={tamano}
-        onPagina={setPagina}
-        onTamano={(t) => {
-          setTamano(t)
-          setPagina(1)
-        }}
+      <TablaPaginada
+        filas={t.registros}
+        columnas={COLUMNAS_TRANSFORMADO}
+        claveFila={(r) => r.idLocal}
+        etiqueta="Datos transformados"
+        vacio="No hay registros."
       />
     </div>
   )

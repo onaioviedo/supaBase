@@ -1,392 +1,477 @@
 "use client"
 
+import * as React from "react"
 import {
-  ArrowCounterClockwiseIcon,
-  ArrowRightIcon,
-  CaretDownIcon,
-  CaretUpIcon,
   CheckSquareIcon,
-  XSquareIcon,
-} from "@phosphor-icons/react"
-import { useState } from "react"
+  ChevronDownIcon,
+  FilterXIcon,
+  MousePointerClickIcon,
+  SquareIcon,
+  XCircleIcon,
+  ZapIcon,
+} from "lucide-react"
 
+import { Alert, AlertDescription } from "@/components/ui/alert"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import type { PipelineEtl } from "@/hooks/use-pipeline-etl"
+import { NOMBRES_CIUDADES } from "@/lib/etl/ciudades"
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
-import { FILTROS_VACIOS, ORDEN_INICIAL, paginar } from "@/lib/etl/filtrado"
-import { claveRegistro } from "@/lib/etl/limpieza"
-import type { CampoOrden, Ciudad, Filtros, Orden, Registro } from "@/lib/etl/tipos"
+  cumpleFiltros,
+  ETIQUETAS_ORDEN,
+  FILTROS_INICIALES,
+  ORDEN_INICIAL,
+  type CampoOrden,
+  type Filtros,
+} from "@/lib/etl/filtros"
+import type { RegistroValido } from "@/lib/etl/tipos"
+import { cn } from "@/lib/utils"
 
-import {
-  formatoEntero,
-  formatoFechaUtc,
-  formatoNumero,
-  Paginacion,
-  SelectorNativo,
-  Vacio,
-} from "./comunes"
+import { formatoEntero, formatoFechaUtc, formatoNumero } from "./formato"
+import { Selector } from "./selector"
+import { SinDatos } from "./sin-datos"
+import { TablaPaginada, type Columna } from "./tabla-paginada"
 
-export const COLUMNAS: { campo: CampoOrden; titulo: string; numerica: boolean }[] = [
-  { campo: "ciudad", titulo: "Ciudad", numerica: false },
-  { campo: "fecha_hora", titulo: "Fecha y hora (UTC)", numerica: false },
-  { campo: "temperatura_c", titulo: "Temperatura (°C)", numerica: true },
-  { campo: "humedad_pct", titulo: "Humedad (%)", numerica: true },
-  { campo: "precipitacion_mm", titulo: "Precipitación (mm)", numerica: true },
+export const COLUMNAS_VALIDO: Columna<RegistroValido>[] = [
+  { id: "ciudad", titulo: "Ciudad", celda: (r) => r.ciudad },
+  {
+    id: "fecha",
+    titulo: "Fecha y hora (UTC)",
+    celda: (r) => formatoFechaUtc(r.fecha_hora),
+  },
+  {
+    id: "temp",
+    titulo: "Temperatura (°C)",
+    celda: (r) => formatoNumero(r.temperatura_c),
+    numerica: true,
+  },
+  {
+    id: "hum",
+    titulo: "Humedad (%)",
+    celda: (r) => formatoNumero(r.humedad_pct),
+    numerica: true,
+  },
+  {
+    id: "prec",
+    titulo: "Precipitación (mm)",
+    celda: (r) => formatoNumero(r.precipitacion_mm),
+    numerica: true,
+  },
 ]
 
-/** "" → null; cualquier otro valor del input numérico → número. */
-const aNumero = (v: string) => (v.trim() === "" ? null : Number(v))
-/** datetime-local ("2026-09-01T05:00") interpretado como UTC → "2026-09-01T05:00:00Z". */
-const aIsoUtc = (v: string) => (v === "" ? null : `${v.slice(0, 16)}:00Z`)
-const deIsoUtc = (v: string | null) => (v ? v.slice(0, 16) : "")
+type Vista = "coinciden" | "excluidos"
 
-function RangoNumerico({
-  etiqueta,
-  unidad,
-  min,
-  max,
-  onMin,
-  onMax,
-}: {
-  etiqueta: string
-  unidad: string
-  min: number | null
-  max: number | null
-  onMin: (v: number | null) => void
-  onMax: (v: number | null) => void
-}) {
-  const invertido = min !== null && max !== null && min > max
-  return (
-    <fieldset className="flex flex-col gap-1.5">
-      <legend className="mb-1.5 text-sm font-medium">
-        {etiqueta} <span className="font-normal text-muted-foreground">({unidad})</span>
-      </legend>
-      <div className="grid grid-cols-2 gap-2">
-        <Input
-          type="number"
-          step="any"
-          placeholder="mín."
-          aria-label={`${etiqueta} mínima`}
-          value={min ?? ""}
-          onChange={(e) => onMin(aNumero(e.target.value))}
-          aria-invalid={invertido}
-        />
-        <Input
-          type="number"
-          step="any"
-          placeholder="máx."
-          aria-label={`${etiqueta} máxima`}
-          value={max ?? ""}
-          onChange={(e) => onMax(aNumero(e.target.value))}
-          aria-invalid={invertido}
-        />
-      </div>
-      {invertido && <p className="text-xs text-destructive">El mínimo es mayor que el máximo.</p>}
-    </fieldset>
+export function PestanaValidos({ etl }: { etl: PipelineEtl }) {
+  const [vista, setVista] = React.useState<Vista>("coinciden")
+  const validos = etl.procesado?.limpieza.validos
+  const excluidos = React.useMemo(
+    () =>
+      vista === "excluidos" && validos
+        ? validos.filter((r) => !cumpleFiltros(r, etl.filtrosInterpretados))
+        : [],
+    [vista, validos, etl.filtrosInterpretados]
   )
-}
 
-export function PestanaValidos({
-  validos,
-  ciudades,
-  filtros,
-  onFiltros,
-  orden,
-  onOrden,
-  coinciden,
-  seleccion,
-  paraCargar,
-  fueraDeFiltro,
-  onAlternar,
-  onSeleccionarCoincidencias,
-  onVaciar,
-  onIrACarga,
-}: {
-  validos: Registro[]
-  ciudades: Ciudad[]
-  filtros: Filtros
-  onFiltros: (f: Filtros) => void
-  orden: Orden
-  onOrden: (o: Orden) => void
-  coinciden: Registro[]
-  seleccion: ReadonlySet<string>
-  paraCargar: number
-  fueraDeFiltro: number
-  onAlternar: (claves: string[], seleccionar: boolean) => void
-  onSeleccionarCoincidencias: () => void
-  onVaciar: () => void
-  onIrACarga: () => void
-}) {
-  const [pagina, setPagina] = useState(1)
-  const [tamano, setTamano] = useState(25)
-
-  if (validos.length === 0) return <Vacio>No hay registros válidos todavía.</Vacio>
-
-  // Cambiar filtros u orden vuelve a la primera página (la paginación es solo vista).
-  const cambiarFiltros = (cambios: Partial<Filtros>) => {
-    onFiltros({ ...filtros, ...cambios })
-    setPagina(1)
-  }
-  const cambiarOrden = (o: Orden) => {
-    onOrden(o)
-    setPagina(1)
+  if (!validos) {
+    return <SinDatos>Aún no hay registros válidos.</SinDatos>
   }
 
-  const vista = paginar(coinciden, pagina, tamano)
-  const clavesPagina = vista.filas.map(claveRegistro)
-  const marcadasPagina = clavesPagina.filter((k) => seleccion.has(k)).length
-  const fechasInvertidas =
-    filtros.desde !== null && filtros.hasta !== null && filtros.desde > filtros.hasta
+  const automatico = etl.modoSeleccion === "automatico"
+  const nCoinciden = etl.filtradosOrdenados.length
+  const nExcluidos = validos.length - nCoinciden
 
   return (
     <div className="flex flex-col gap-4">
-      <p className="text-sm text-muted-foreground">
-        Orden de operaciones: <strong>válidos → filtros → ordenación → selección → carga</strong>. Cambiar
-        los filtros no selecciona filas nuevas automáticamente.
-      </p>
+      <PanelFiltros etl={etl} />
 
-      <section aria-label="Filtros" className="grid gap-4 rounded-2xl border p-4 md:grid-cols-2 xl:grid-cols-4">
-        <fieldset className="flex flex-col gap-2">
-          <legend className="mb-1.5 text-sm font-medium">Ciudades</legend>
-          <div className="flex flex-wrap gap-x-4 gap-y-2">
-            {ciudades.map((c) => (
-              <Label key={c.id} className="flex items-center gap-2 font-normal">
-                <Checkbox
-                  checked={filtros.ciudades.includes(c.nombre)}
-                  onCheckedChange={(v) =>
-                    cambiarFiltros({
-                      ciudades: v
-                        ? [...filtros.ciudades, c.nombre]
-                        : filtros.ciudades.filter((n) => n !== c.nombre),
-                    })
-                  }
-                />
-                {c.nombre}
-              </Label>
-            ))}
-          </div>
-          <p className="text-xs text-muted-foreground">Sin marcar = todas.</p>
-        </fieldset>
-
-        <fieldset className="flex flex-col gap-1.5">
-          <legend className="mb-1.5 text-sm font-medium">
-            Intervalo de fecha y hora <span className="font-normal text-muted-foreground">(UTC)</span>
-          </legend>
-          <Input
-            type="datetime-local"
-            step={3600}
-            aria-label="Desde (UTC)"
-            value={deIsoUtc(filtros.desde)}
-            onChange={(e) => cambiarFiltros({ desde: aIsoUtc(e.target.value) })}
-            aria-invalid={fechasInvertidas}
-          />
-          <Input
-            type="datetime-local"
-            step={3600}
-            aria-label="Hasta (UTC)"
-            value={deIsoUtc(filtros.hasta)}
-            onChange={(e) => cambiarFiltros({ hasta: aIsoUtc(e.target.value) })}
-            aria-invalid={fechasInvertidas}
-          />
-          {fechasInvertidas && <p className="text-xs text-destructive">“Desde” es posterior a “hasta”.</p>}
-        </fieldset>
-
-        <div className="flex flex-col gap-3">
-          <RangoNumerico
-            etiqueta="Temperatura"
-            unidad="°C"
-            min={filtros.temperaturaMin}
-            max={filtros.temperaturaMax}
-            onMin={(v) => cambiarFiltros({ temperaturaMin: v })}
-            onMax={(v) => cambiarFiltros({ temperaturaMax: v })}
-          />
-          <RangoNumerico
-            etiqueta="Humedad"
-            unidad="%"
-            min={filtros.humedadMin}
-            max={filtros.humedadMax}
-            onMin={(v) => cambiarFiltros({ humedadMin: v })}
-            onMax={(v) => cambiarFiltros({ humedadMax: v })}
-          />
+      <div
+        className="flex flex-col gap-3 rounded-lg border bg-muted/30 p-3"
+        aria-label="Selección"
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge
+            variant={automatico ? "secondary" : "outline"}
+            className="gap-1"
+          >
+            {automatico ? (
+              <ZapIcon aria-hidden />
+            ) : (
+              <MousePointerClickIcon aria-hidden />
+            )}
+            Selección {automatico ? "automática" : "manual"}
+          </Badge>
+          <span className="text-xs text-muted-foreground">
+            {automatico
+              ? "Se sube todo lo que cumple los filtros; se recalcula al cambiarlos."
+              : "Has modificado la selección a mano: cambiar los filtros ya no añade filas."}
+          </span>
         </div>
-
-        <div className="flex flex-col gap-3">
-          <RangoNumerico
-            etiqueta="Precipitación"
-            unidad="mm"
-            min={filtros.precipitacionMin}
-            max={filtros.precipitacionMax}
-            onMin={(v) => cambiarFiltros({ precipitacionMin: v })}
-            onMax={(v) => cambiarFiltros({ precipitacionMax: v })}
-          />
-          <Label className="flex items-center gap-2 font-normal">
-            <Checkbox
-              checked={filtros.soloLluvia}
-              onCheckedChange={(v) => cambiarFiltros({ soloLluvia: Boolean(v) })}
-            />
-            Solo registros con lluvia (precipitación &gt; 0)
-          </Label>
-          <fieldset className="flex flex-col gap-1.5">
-            <legend className="mb-1.5 text-sm font-medium">Ordenar por</legend>
-            <div className="grid grid-cols-[1fr_auto] gap-2">
-              <SelectorNativo
-                aria-label="Campo de ordenación"
-                value={orden.campo}
-                onChange={(e) => cambiarOrden({ ...orden, campo: e.target.value as CampoOrden })}
-              >
-                {COLUMNAS.map((c) => (
-                  <option key={c.campo} value={c.campo}>
-                    {c.titulo}
-                  </option>
-                ))}
-              </SelectorNativo>
-              <SelectorNativo
-                aria-label="Dirección"
-                value={orden.direccion}
-                onChange={(e) => cambiarOrden({ ...orden, direccion: e.target.value as "asc" | "desc" })}
-              >
-                <option value="asc">Ascendente</option>
-                <option value="desc">Descendente</option>
-              </SelectorNativo>
-            </div>
-          </fieldset>
-        </div>
-
-        <div className="flex flex-wrap gap-2 md:col-span-2 xl:col-span-4">
+        <p className="text-sm" aria-live="polite">
+          <strong>{formatoEntero(nCoinciden)}</strong> de{" "}
+          {formatoEntero(validos.length)} válidos coinciden con los filtros ·{" "}
+          <strong>{formatoEntero(etl.conjuntoCarga.registros.length)}</strong>{" "}
+          seleccionados para cargar
+          {etl.conjuntoCarga.seleccionadosFueraDeFiltro > 0 && (
+            <>
+              {" "}
+              ·{" "}
+              <span className="text-amber-800 dark:text-amber-300">
+                {formatoEntero(etl.conjuntoCarga.seleccionadosFueraDeFiltro)}{" "}
+                seleccionados fuera de los filtros (no se subirán)
+              </span>
+            </>
+          )}
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {!automatico && (
+            <Button variant="outline" onClick={etl.activarSeleccionAutomatica}>
+              <ZapIcon aria-hidden />
+              Volver a selección automática
+            </Button>
+          )}
+          {!automatico && (
+            <Button
+              variant="outline"
+              onClick={etl.seleccionarTodasFiltradas}
+              disabled={nCoinciden === 0}
+            >
+              <CheckSquareIcon aria-hidden />
+              Seleccionar las {formatoEntero(nCoinciden)} que cumplen los
+              filtros
+            </Button>
+          )}
           <Button
             variant="outline"
-            size="sm"
-            onClick={() => {
-              onFiltros(FILTROS_VACIOS)
-              onOrden(ORDEN_INICIAL)
-              setPagina(1)
-            }}
+            onClick={etl.vaciarSeleccion}
+            disabled={etl.seleccion.size === 0}
           >
-            <ArrowCounterClockwiseIcon data-icon="inline-start" />
-            Restablecer filtros
-          </Button>
-        </div>
-      </section>
-
-      <div className="flex flex-wrap items-center gap-2" role="status" aria-live="polite">
-        <span className="text-sm">
-          <strong className="tabular-nums">{formatoEntero(coinciden.length)}</strong> de{" "}
-          {formatoEntero(validos.length)} válidos coinciden ·{" "}
-          <strong className="tabular-nums">{formatoEntero(paraCargar)}</strong> seleccionados para cargar
-          {fueraDeFiltro > 0 && (
-            <span className="text-amber-700 dark:text-amber-400">
-              {" "}· {formatoEntero(fueraDeFiltro)} seleccionados fuera de los filtros (no se subirán)
-            </span>
-          )}
-        </span>
-        <div className="ms-auto flex flex-wrap gap-2">
-          <Button size="sm" variant="secondary" onClick={onSeleccionarCoincidencias} disabled={coinciden.length === 0}>
-            <CheckSquareIcon data-icon="inline-start" />
-            Seleccionar las {formatoEntero(coinciden.length)} coincidencias
-          </Button>
-          <Button size="sm" variant="outline" onClick={onVaciar} disabled={seleccion.size === 0}>
-            <XSquareIcon data-icon="inline-start" />
+            <SquareIcon aria-hidden />
             Vaciar selección
           </Button>
-          <Button size="sm" onClick={onIrACarga} disabled={paraCargar === 0}>
-            Revisar carga
-            <ArrowRightIcon data-icon="inline-end" />
-          </Button>
         </div>
+        <p className="text-xs text-muted-foreground">
+          Marcar una fila pasa a selección manual. La casilla de la cabecera
+          solo afecta a la página visible.
+        </p>
       </div>
 
-      {coinciden.length === 0 ? (
-        <Vacio>Ningún registro válido cumple los filtros actuales.</Vacio>
+      <div
+        role="radiogroup"
+        aria-label="Qué filas mostrar"
+        className="flex flex-wrap gap-2"
+      >
+        <Button
+          role="radio"
+          aria-checked={vista === "coinciden"}
+          variant={vista === "coinciden" ? "secondary" : "ghost"}
+          onClick={() => setVista("coinciden")}
+        >
+          Coinciden con los filtros ({formatoEntero(nCoinciden)})
+        </Button>
+        <Button
+          role="radio"
+          aria-checked={vista === "excluidos"}
+          variant={vista === "excluidos" ? "secondary" : "ghost"}
+          onClick={() => setVista("excluidos")}
+        >
+          Excluidos por filtros ({formatoEntero(nExcluidos)})
+        </Button>
+      </div>
+
+      {vista === "coinciden" ? (
+        <TablaPaginada
+          // Vuelve a la página 1 cuando cambian filtros u orden.
+          key={JSON.stringify([etl.filtros, etl.orden])}
+          filas={etl.filtradosOrdenados}
+          columnas={COLUMNAS_VALIDO}
+          claveFila={(r) => r.clave}
+          etiqueta="Registros válidos que coinciden con los filtros"
+          vacio="Ningún registro válido cumple los filtros actuales."
+          seleccion={{
+            seleccionadas: etl.seleccion,
+            alternar: etl.alternarFila,
+            marcar: etl.marcarFilas,
+          }}
+        />
       ) : (
         <>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-10">
-                  <Checkbox
-                    aria-label="Seleccionar todas las filas de esta página"
-                    checked={marcadasPagina === clavesPagina.length}
-                    indeterminate={marcadasPagina > 0 && marcadasPagina < clavesPagina.length}
-                    onCheckedChange={(v) => onAlternar(clavesPagina, Boolean(v))}
-                  />
-                </TableHead>
-                {COLUMNAS.map((c) => {
-                  const activa = orden.campo === c.campo
-                  return (
-                    <TableHead
-                      key={c.campo}
-                      className={c.numerica ? "text-end" : undefined}
-                      aria-sort={activa ? (orden.direccion === "asc" ? "ascending" : "descending") : "none"}
-                    >
-                      <button
-                        type="button"
-                        className="inline-flex items-center gap-1 hover:underline"
-                        onClick={() =>
-                          cambiarOrden({
-                            campo: c.campo,
-                            direccion: activa && orden.direccion === "asc" ? "desc" : "asc",
-                          })
-                        }
-                      >
-                        {c.titulo}
-                        {activa &&
-                          (orden.direccion === "asc" ? (
-                            <CaretUpIcon aria-label="ascendente" />
-                          ) : (
-                            <CaretDownIcon aria-label="descendente" />
-                          ))}
-                      </button>
-                    </TableHead>
-                  )
-                })}
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {vista.filas.map((r) => {
-                const clave = claveRegistro(r)
-                const marcada = seleccion.has(clave)
-                return (
-                  <TableRow key={clave} data-state={marcada ? "selected" : undefined}>
-                    <TableCell>
-                      <Checkbox
-                        aria-label={`Seleccionar ${r.ciudad} ${formatoFechaUtc(r.fecha_hora)}`}
-                        checked={marcada}
-                        onCheckedChange={(v) => onAlternar([clave], Boolean(v))}
-                      />
-                    </TableCell>
-                    <TableCell>{r.ciudad}</TableCell>
-                    <TableCell className="tabular-nums">{formatoFechaUtc(r.fecha_hora)}</TableCell>
-                    <TableCell className="text-end tabular-nums">{formatoNumero(r.temperatura_c)}</TableCell>
-                    <TableCell className="text-end tabular-nums">{formatoNumero(r.humedad_pct)}</TableCell>
-                    <TableCell className="text-end tabular-nums">{formatoNumero(r.precipitacion_mm)}</TableCell>
-                  </TableRow>
-                )
-              })}
-            </TableBody>
-          </Table>
-          <Paginacion
-            pagina={vista.pagina}
-            totalPaginas={vista.totalPaginas}
-            total={coinciden.length}
-            tamano={tamano}
-            etiqueta="coincidencias"
-            onPagina={setPagina}
-            onTamano={(t) => {
-              setTamano(t)
-              setPagina(1)
-            }}
+          <p className="text-xs text-muted-foreground">
+            Registros válidos que no cumplen los filtros. No son errores de
+            calidad (esos están en «Rechazados») y no se pueden subir mientras
+            los filtros los excluyan.
+          </p>
+          <TablaPaginada
+            filas={excluidos}
+            columnas={COLUMNAS_VALIDO}
+            claveFila={(r) => r.clave}
+            etiqueta="Registros válidos excluidos por los filtros"
+            vacio="Los filtros no excluyen ningún registro."
           />
         </>
       )}
     </div>
+  )
+}
+
+function CampoRango({
+  etiqueta,
+  unidad,
+  min,
+  max,
+  alCambiar,
+}: {
+  etiqueta: string
+  unidad: string
+  min: string
+  max: string
+  alCambiar: (limite: "min" | "max", valor: string) => void
+}) {
+  const id = React.useId()
+  return (
+    <fieldset className="flex flex-col gap-1.5">
+      <legend className="mb-1.5 text-sm font-medium">
+        {etiqueta} ({unidad})
+      </legend>
+      <div className="flex items-center gap-1.5">
+        <Label htmlFor={`${id}-min`} className="sr-only">
+          {etiqueta} mínima
+        </Label>
+        <Input
+          id={`${id}-min`}
+          inputMode="decimal"
+          placeholder="mín."
+          value={min}
+          onChange={(e) => alCambiar("min", e.target.value)}
+          className="w-20"
+        />
+        <span aria-hidden className="text-muted-foreground">
+          –
+        </span>
+        <Label htmlFor={`${id}-max`} className="sr-only">
+          {etiqueta} máxima
+        </Label>
+        <Input
+          id={`${id}-max`}
+          inputMode="decimal"
+          placeholder="máx."
+          value={max}
+          onChange={(e) => alCambiar("max", e.target.value)}
+          className="w-20"
+        />
+      </div>
+    </fieldset>
+  )
+}
+
+function PanelFiltros({ etl }: { etl: PipelineEtl }) {
+  const { filtros, setFiltros, orden, setOrden } = etl
+  const cambiar = <K extends keyof Filtros>(clave: K, valor: Filtros[K]) =>
+    setFiltros((f) => ({ ...f, [clave]: valor }))
+  const ciudadesDisponibles =
+    etl.extraccion?.config.ciudades ?? NOMBRES_CIUDADES
+  // Plegado por defecto: la tabla es lo primero que se ve.
+  const [abierto, setAbierto] = React.useState(false)
+  const idContenido = React.useId()
+  const activos = (Object.keys(FILTROS_INICIALES) as (keyof Filtros)[]).filter(
+    (k) => JSON.stringify(filtros[k]) !== JSON.stringify(FILTROS_INICIALES[k])
+  ).length
+  const ordenCambiado =
+    orden.campo !== ORDEN_INICIAL.campo ||
+    orden.direccion !== ORDEN_INICIAL.direccion
+
+  return (
+    <section
+      aria-label="Filtros y ordenación"
+      className="flex flex-col gap-4 rounded-lg border p-3"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3>
+          <button
+            type="button"
+            aria-expanded={abierto}
+            aria-controls={idContenido}
+            onClick={() => setAbierto(!abierto)}
+            className="flex items-center gap-2 rounded-md text-left text-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+          >
+            <ChevronDownIcon
+              aria-hidden
+              className={cn(
+                "size-4 text-muted-foreground transition-transform",
+                abierto && "rotate-180"
+              )}
+            />
+            <span className="font-medium">Filtros y ordenación</span>
+            <span className="text-xs text-muted-foreground">
+              {activos === 0
+                ? "sin filtros"
+                : `${activos} ${activos === 1 ? "filtro activo" : "filtros activos"}`}{" "}
+              · {ETIQUETAS_ORDEN[orden.campo]}{" "}
+              {orden.direccion === "asc" ? "↑" : "↓"}
+            </span>
+          </button>
+        </h3>
+        {(activos > 0 || ordenCambiado) && (
+          <Button variant="ghost" size="sm" onClick={etl.restablecerFiltros}>
+            <FilterXIcon aria-hidden />
+            Restablecer filtros
+          </Button>
+        )}
+      </div>
+
+      {abierto && (
+        <div id={idContenido} className="flex flex-col gap-4">
+          <fieldset>
+            <legend className="mb-1.5 text-sm font-medium">
+              Ciudades{" "}
+              <span className="font-normal text-muted-foreground">
+                (ninguna marcada = todas)
+              </span>
+            </legend>
+            <div className="flex flex-wrap gap-x-4 gap-y-2">
+              {ciudadesDisponibles.map((c) => (
+                <Label key={c} className="font-normal">
+                  <Checkbox
+                    checked={filtros.ciudades.includes(c)}
+                    onCheckedChange={(v) =>
+                      cambiar(
+                        "ciudades",
+                        v
+                          ? [...filtros.ciudades, c]
+                          : filtros.ciudades.filter((x) => x !== c)
+                      )
+                    }
+                  />
+                  {c}
+                </Label>
+              ))}
+            </div>
+          </fieldset>
+
+          <div className="grid gap-4 @xl:grid-cols-2 @5xl:grid-cols-4">
+            <fieldset className="flex flex-col gap-1.5 @xl:col-span-2">
+              <legend className="mb-1.5 text-sm font-medium">
+                Intervalo de fecha y hora (UTC, ambos extremos incluidos)
+              </legend>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Label htmlFor="filtro-desde" className="sr-only">
+                  Desde
+                </Label>
+                <Input
+                  id="filtro-desde"
+                  type="datetime-local"
+                  value={filtros.desde}
+                  onChange={(e) => cambiar("desde", e.target.value)}
+                  className="w-auto"
+                />
+                <span aria-hidden className="text-muted-foreground">
+                  →
+                </span>
+                <Label htmlFor="filtro-hasta" className="sr-only">
+                  Hasta
+                </Label>
+                <Input
+                  id="filtro-hasta"
+                  type="datetime-local"
+                  value={filtros.hasta}
+                  onChange={(e) => cambiar("hasta", e.target.value)}
+                  className="w-auto"
+                />
+              </div>
+            </fieldset>
+            <CampoRango
+              etiqueta="Temperatura"
+              unidad="°C"
+              min={filtros.temperaturaMin}
+              max={filtros.temperaturaMax}
+              alCambiar={(l, v) =>
+                cambiar(l === "min" ? "temperaturaMin" : "temperaturaMax", v)
+              }
+            />
+            <CampoRango
+              etiqueta="Humedad"
+              unidad="%"
+              min={filtros.humedadMin}
+              max={filtros.humedadMax}
+              alCambiar={(l, v) =>
+                cambiar(l === "min" ? "humedadMin" : "humedadMax", v)
+              }
+            />
+            <CampoRango
+              etiqueta="Precipitación"
+              unidad="mm"
+              min={filtros.precipitacionMin}
+              max={filtros.precipitacionMax}
+              alCambiar={(l, v) =>
+                cambiar(
+                  l === "min" ? "precipitacionMin" : "precipitacionMax",
+                  v
+                )
+              }
+            />
+            <div className="flex items-end">
+              <Label className="font-normal">
+                <Checkbox
+                  checked={filtros.soloLluvia}
+                  onCheckedChange={(v) => cambiar("soloLluvia", v)}
+                />
+                Solo registros con lluvia (precipitación &gt; 0 mm)
+              </Label>
+            </div>
+            <div className="flex flex-wrap items-end gap-2 @xl:col-span-2">
+              <label className="flex flex-col gap-1.5 text-sm font-medium">
+                Ordenar por
+                <Selector
+                  value={orden.campo}
+                  onChange={(e) =>
+                    setOrden((o) => ({
+                      ...o,
+                      campo: e.target.value as CampoOrden,
+                    }))
+                  }
+                >
+                  {Object.entries(ETIQUETAS_ORDEN).map(([valor, texto]) => (
+                    <option key={valor} value={valor}>
+                      {texto}
+                    </option>
+                  ))}
+                </Selector>
+              </label>
+              <label className="flex flex-col gap-1.5 text-sm font-medium">
+                Dirección
+                <Selector
+                  value={orden.direccion}
+                  onChange={(e) =>
+                    setOrden((o) => ({
+                      ...o,
+                      direccion: e.target.value as "asc" | "desc",
+                    }))
+                  }
+                >
+                  <option value="asc">Ascendente</option>
+                  <option value="desc">Descendente</option>
+                </Selector>
+              </label>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {etl.filtrosInterpretados.errores.length > 0 && (
+        <Alert variant="destructive">
+          <XCircleIcon aria-hidden />
+          <AlertDescription>
+            Revisa los filtros (un límite que no es un número se ignora):
+            <ul className="list-disc pl-4">
+              {etl.filtrosInterpretados.errores.map((e) => (
+                <li key={e}>{e}</li>
+              ))}
+            </ul>
+          </AlertDescription>
+        </Alert>
+      )}
+    </section>
   )
 }

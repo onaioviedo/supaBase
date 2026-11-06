@@ -1,103 +1,112 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import * as React from "react"
 
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
-import { paginar } from "@/lib/etl/filtrado"
-import { MOTIVO_DUPLICADO } from "@/lib/etl/limpieza"
+import type { PipelineEtl } from "@/hooks/use-pipeline-etl"
 import type { RegistroRechazado } from "@/lib/etl/tipos"
 
-import { formatoEntero, Paginacion, Vacio, ValorBruto } from "./comunes"
+import { formatoEntero, formatoFechaUtc } from "./formato"
+import { Valor } from "./pestana-transformados"
+import { SinDatos } from "./sin-datos"
+import { TablaPaginada, type Columna } from "./tabla-paginada"
 
-/** Agrupa "Temperatura: valor nulo (null)" y "Humedad fuera de rango 0–100 % (104)" por tipo. */
-function tipoMotivo(motivo: string) {
-  return motivo.replace(/ \([^)]*\)$/, "")
-}
+const COLUMNAS: Columna<RegistroRechazado>[] = [
+  {
+    id: "ciudad",
+    titulo: "Ciudad",
+    celda: ({ registro: r }) => r.ciudad ?? <Valor v={null} />,
+  },
+  {
+    id: "indice",
+    titulo: "Posición",
+    celda: ({ registro: r }) => r.indice,
+    numerica: true,
+  },
+  {
+    id: "fecha",
+    titulo: "fecha_hora (UTC)",
+    celda: ({ registro: r }) =>
+      r.fecha_hora ? (
+        formatoFechaUtc(r.fecha_hora)
+      ) : (
+        <code className="text-xs">
+          {JSON.stringify(r.fechaOriginal) ?? "ausente"}
+        </code>
+      ),
+  },
+  {
+    id: "temp",
+    titulo: "Temperatura (°C)",
+    celda: ({ registro: r }) => <Valor v={r.temperatura_c} />,
+    numerica: true,
+  },
+  {
+    id: "hum",
+    titulo: "Humedad (%)",
+    celda: ({ registro: r }) => <Valor v={r.humedad_pct} />,
+    numerica: true,
+  },
+  {
+    id: "prec",
+    titulo: "Precipitación (mm)",
+    celda: ({ registro: r }) => <Valor v={r.precipitacion_mm} />,
+    numerica: true,
+  },
+  {
+    id: "motivo",
+    titulo: "Motivo del rechazo",
+    celda: ({ motivos }) => (
+      <span className="text-xs whitespace-normal">{motivos.join("; ")}</span>
+    ),
+  },
+]
 
-export function PestanaRechazados({ rechazados }: { rechazados: RegistroRechazado[] }) {
-  const [pagina, setPagina] = useState(1)
-  const [tamano, setTamano] = useState(25)
+export function PestanaRechazados({ etl }: { etl: PipelineEtl }) {
+  const limpieza = etl.procesado?.limpieza
 
-  const resumen = useMemo(() => {
+  const porMotivo = React.useMemo(() => {
     const cuenta = new Map<string, number>()
-    for (const r of rechazados)
-      for (const m of r.motivos) cuenta.set(tipoMotivo(m), (cuenta.get(tipoMotivo(m)) ?? 0) + 1)
+    for (const r of limpieza?.rechazados ?? []) {
+      for (const m of r.motivos) {
+        // Agrupa "humedad_pct fuera de rango (105)" y similares por su texto base.
+        const base = m.replace(/\s*\(.*\)$/, "")
+        cuenta.set(base, (cuenta.get(base) ?? 0) + 1)
+      }
+    }
     return [...cuenta.entries()].sort((a, b) => b[1] - a[1])
-  }, [rechazados])
+  }, [limpieza])
 
-  if (rechazados.length === 0) {
-    return (
-      <Vacio>
-        No hay registros rechazados por calidad. En los datos reales de Open-Meteo es habitual; las pruebas
-        automáticas usan fixtures con nulos y duplicados para comprobar estas reglas.
-      </Vacio>
-    )
+  if (!limpieza) {
+    return <SinDatos>Aún no se ha ejecutado la limpieza.</SinDatos>
   }
-  const vista = paginar(rechazados, pagina, tamano)
 
   return (
     <div className="flex flex-col gap-3">
-      <p className="text-sm text-muted-foreground">
-        Descartes por <strong>calidad</strong> (no por filtros). Ningún valor ausente se convierte en cero. En
-        duplicados de ciudad + fecha_hora se conserva la primera aparición válida, en el orden de extracción.
+      <p className="text-xs text-muted-foreground">
+        Descartes por <strong>calidad</strong>: faltan datos, valores fuera de
+        rango o duplicados. Las filas que solo quedan fuera por tus filtros no
+        aparecen aquí (están en «Válidos → Excluidos por filtros»). Duplicados:
+        se conserva la primera aparición válida de cada ciudad + fecha_hora.
       </p>
-      <ul className="flex flex-wrap gap-2 text-xs">
-        {resumen.map(([motivo, n]) => (
-          <li key={motivo} className="rounded-full border px-3 py-1">
-            {motivo}: <strong className="tabular-nums">{formatoEntero(n)}</strong>
-          </li>
-        ))}
-      </ul>
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead>Ciudad</TableHead>
-            <TableHead className="text-end">Índice</TableHead>
-            <TableHead>time (original)</TableHead>
-            <TableHead className="text-end">Temperatura (°C)</TableHead>
-            <TableHead className="text-end">Humedad (%)</TableHead>
-            <TableHead className="text-end">Precipitación (mm)</TableHead>
-            <TableHead>Motivo del rechazo</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {vista.filas.map(({ fila, motivos }) => (
-            <TableRow key={`${fila.ciudad}-${fila.indice}`}>
-              <TableCell>{fila.ciudad ?? <ValorBruto valor={null} />}</TableCell>
-              <TableCell className="text-end tabular-nums">{fila.indice}</TableCell>
-              <TableCell className="font-mono text-xs"><ValorBruto valor={fila.fecha_original} /></TableCell>
-              <TableCell className="text-end"><ValorBruto valor={fila.temperatura_c} /></TableCell>
-              <TableCell className="text-end"><ValorBruto valor={fila.humedad_pct} /></TableCell>
-              <TableCell className="text-end"><ValorBruto valor={fila.precipitacion_mm} /></TableCell>
-              <TableCell className="max-w-xs text-xs whitespace-normal">
-                {motivos.map((m) => (
-                  <span key={m} className={m === MOTIVO_DUPLICADO ? "block text-amber-700 dark:text-amber-400" : "block text-destructive"}>
-                    {m}
-                  </span>
-                ))}
-              </TableCell>
-            </TableRow>
+      {porMotivo.length > 0 && (
+        <ul
+          className="flex flex-wrap gap-2 text-xs"
+          aria-label="Rechazos por motivo"
+        >
+          {porMotivo.map(([motivo, n]) => (
+            <li key={motivo} className="rounded-md border px-2 py-1">
+              {motivo}:{" "}
+              <strong className="tabular-nums">{formatoEntero(n)}</strong>
+            </li>
           ))}
-        </TableBody>
-      </Table>
-      <Paginacion
-        pagina={vista.pagina}
-        totalPaginas={vista.totalPaginas}
-        total={rechazados.length}
-        tamano={tamano}
-        etiqueta="rechazados"
-        onPagina={setPagina}
-        onTamano={(t) => {
-          setTamano(t)
-          setPagina(1)
-        }}
+        </ul>
+      )}
+      <TablaPaginada
+        filas={limpieza.rechazados}
+        columnas={COLUMNAS}
+        claveFila={(r) => r.registro.idLocal}
+        etiqueta="Registros rechazados"
+        vacio="Ningún registro rechazado: todos los registros superan las reglas de calidad."
       />
     </div>
   )

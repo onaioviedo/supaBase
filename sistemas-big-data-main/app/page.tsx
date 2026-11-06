@@ -1,9 +1,5 @@
-import { PipelineEtl } from "@/components/etl/pipeline-etl"
+import { AplicacionEtl } from "@/components/etl/aplicacion-etl"
 
 export default function Page() {
-  return (
-    <main className="min-h-svh bg-background">
-      <PipelineEtl />
-    </main>
-  )
+  return <AplicacionEtl />
 }
